@@ -6,29 +6,24 @@ edition = "2018"
 build = "build.rs"
 
 [features]
-default = ["rocksdb/snappy", "rocksdb/lz4", "rocksdb/zstd", "rocksdb/zlib", "rocksdb/bzip2"]
+default = ["rocksdb/zstd"]
 
 [package.metadata.configure_me]
 spec = "config_spec.toml"
 
 [dependencies]
 anyhow = "1.0"
-bitcoin = { version = "0.26", features = ["use-serde"] }
-bitcoincore-rpc = "0.13"
-chrono = "0.4"
-configure_me = "0.3"
+bitcoin = { version = "0.26", features = ["use-serde", "rand"] }
+configure_me = "0.4"
 env_logger = "0.7"
 hyper = "0.10"
 log = "0.4"
-prometheus = { version = "0.10", features = ["process"] }
-# keeping older protobuf due to https://github.com/stepancheg/rust-protobuf/blob/master/CHANGELOG.md#2150---2020-06-21 (for Rust 1.41.1 compatibility)
-protobuf = "=2.14.0"
-# cannot update to latest rocksdb due to https://github.com/rust-rocksdb/rust-rocksdb/commit/3e223d15919e4e31e50af0dc3d52439a4635852c (for Rust 1.41.1 compatibility)
-rocksdb = { git = "https://github.com/romanz/rust-rocksdb", rev = "9f639dd7cd378569a96a5824b09ea03104cadfff", default-features = false }
+prometheus = { version = "0.11", features = ["process"] }
+rocksdb = { git = "https://github.com/rust-rocksdb/rust-rocksdb", rev = "3d32011909367612ae59761bd786fe7e5ee14c46", default-features = false }
 rust-crypto = "0.2"
 serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
 
 [build-dependencies]
-configure_me_codegen = "0.3"
+configure_me_codegen = "0.4"

@@ -1,16 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use std::fs::File;
-use std::io::{Seek, SeekFrom};
-use std::path::PathBuf;
+use std::convert::TryInto;
 
 use bitcoin::{
     consensus::encode::{deserialize, serialize, Decodable, Encodable},
     hashes::{borrow_slice_impl, hash_newtype, hex_fmt_impl, index_impl, serde_impl, sha256, Hash},
-    BlockHeader, Script, Transaction, Txid,
+    BlockHeader, OutPoint, Script, Txid,
 };
 
-use crate::{daemon::Daemon, db};
+use crate::db;
 
 macro_rules! impl_consensus_encoding {
     ($thing:ident, $($field:ident),+) => (
@@ -39,72 +37,6 @@ macro_rules! impl_consensus_encoding {
     );
 }
 
-#[derive(Debug)]
-pub struct Confirmed {
-    pub tx: Transaction,
-    pub txid: Txid,
-    pub header: BlockHeader,
-    pub height: usize,
-    pub file_offset: u32, // for correct ordering (https://electrumx-spesmilo.readthedocs.io/en/latest/protocol-basics.html#status)
-}
-
-impl Confirmed {
-    pub(crate) fn new(
-        tx: Transaction,
-        header: BlockHeader,
-        height: usize,
-        reader: &Reader,
-    ) -> Self {
-        let txid = tx.txid();
-        Self {
-            tx,
-            txid,
-            header,
-            height,
-            file_offset: reader.offset,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Copy, Clone)]
-pub(crate) struct FilePos {
-    pub file_id: u16, // currently there are <3k blk files
-    pub offset: u32,  // currently blk files are ~128MB (2**27)
-}
-
-impl FilePos {
-    pub fn reader(self, daemon: &Daemon) -> Reader {
-        let file = daemon.blk_file_path(self.file_id as usize);
-        Reader {
-            file,
-            offset: self.offset,
-        }
-    }
-}
-
-impl_consensus_encoding!(FilePos, file_id, offset);
-
-#[derive(Debug)]
-pub(crate) struct Reader {
-    file: PathBuf,
-    offset: u32,
-}
-
-impl Reader {
-    pub fn read<T>(&self) -> Result<T>
-    where
-        T: Decodable,
-    {
-        let mut file =
-            File::open(&self.file).with_context(|| format!("failed to open {:?}", self))?;
-        file.seek(SeekFrom::Start(self.offset.into()))
-            .with_context(|| format!("failed to seek {:?}", self))?;
-        T::consensus_decode(&mut file).with_context(|| format!("failed to decode {:?}", self))
-    }
-}
-
-// ***************************************************************************
-
 hash_newtype!(
     ScriptHash,
     sha256::Hash,
@@ -119,40 +51,40 @@ impl ScriptHash {
     }
 
     fn prefix(&self) -> ScriptHashPrefix {
-        let mut prefix = [0u8; SCRIPT_HASH_PREFIX_LEN];
-        prefix.copy_from_slice(&self.0[..SCRIPT_HASH_PREFIX_LEN]);
+        let mut prefix = [0u8; PREFIX_LEN];
+        prefix.copy_from_slice(&self.0[..PREFIX_LEN]);
         ScriptHashPrefix { prefix }
     }
 }
 
-const SCRIPT_HASH_PREFIX_LEN: usize = 8;
+const PREFIX_LEN: usize = 8;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct ScriptHashPrefix {
-    prefix: [u8; SCRIPT_HASH_PREFIX_LEN],
+    prefix: [u8; PREFIX_LEN],
 }
 
 impl_consensus_encoding!(ScriptHashPrefix, prefix);
 
+pub type Height = u32;
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ScriptHashRow {
     prefix: ScriptHashPrefix,
-    pos: FilePos, // transaction position on disk
+    height: Height, // transaction confirmed height
 }
 
-impl_consensus_encoding!(ScriptHashRow, prefix, pos);
+impl_consensus_encoding!(ScriptHashRow, prefix, height);
 
 impl ScriptHashRow {
-    pub fn scan_prefix(script_hash: &ScriptHash) -> Box<[u8]> {
-        script_hash.0[..SCRIPT_HASH_PREFIX_LEN]
-            .to_vec()
-            .into_boxed_slice()
+    pub fn scan_prefix(script_hash: ScriptHash) -> Box<[u8]> {
+        script_hash.0[..PREFIX_LEN].to_vec().into_boxed_slice()
     }
 
-    pub fn new(script_hash: ScriptHash, pos: FilePos) -> Self {
+    pub fn new(script_hash: ScriptHash, height: usize) -> Self {
         Self {
             prefix: script_hash.prefix(),
-            pos,
+            height: height.try_into().expect("invalid height"),
         }
     }
 
@@ -160,49 +92,98 @@ impl ScriptHashRow {
         serialize(self).into_boxed_slice()
     }
 
-    pub fn from_db_row(row: &[u8]) -> Result<Self> {
-        deserialize(&row).context("bad ScriptHashRow")
+    pub fn from_db_row(row: &[u8]) -> Self {
+        deserialize(&row).expect("bad ScriptHashRow")
     }
 
-    pub fn position(&self) -> &FilePos {
-        &self.pos
+    pub fn height(&self) -> usize {
+        self.height.try_into().expect("invalid height")
     }
 }
 
 // ***************************************************************************
 
-const TXID_PREFIX_LEN: usize = 8;
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct SpendingPrefix {
+    prefix: [u8; PREFIX_LEN],
+}
+
+impl_consensus_encoding!(SpendingPrefix, prefix);
+
+fn spending_prefix(prev: OutPoint) -> SpendingPrefix {
+    let txid_prefix = &prev.txid[..PREFIX_LEN];
+    let value = u64::from_be_bytes(txid_prefix.try_into().unwrap());
+    let value = value.wrapping_add(prev.vout.into());
+    SpendingPrefix {
+        prefix: value.to_be_bytes(),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct SpendingPrefixRow {
+    prefix: SpendingPrefix,
+    height: Height, // transaction confirmed height
+}
+
+impl_consensus_encoding!(SpendingPrefixRow, prefix, height);
+
+impl SpendingPrefixRow {
+    pub fn scan_prefix(outpoint: OutPoint) -> Box<[u8]> {
+        Box::new(spending_prefix(outpoint).prefix)
+    }
+
+    pub fn new(outpoint: OutPoint, height: usize) -> Self {
+        Self {
+            prefix: spending_prefix(outpoint),
+            height: height.try_into().expect("invalid height"),
+        }
+    }
+
+    pub fn to_db_row(&self) -> db::Row {
+        serialize(self).into_boxed_slice()
+    }
+
+    pub fn from_db_row(row: &[u8]) -> Self {
+        deserialize(&row).expect("bad SpendingPrefixRow")
+    }
+
+    pub fn height(&self) -> usize {
+        self.height.try_into().expect("invalid height")
+    }
+}
+
+// ***************************************************************************
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct TxidPrefix {
-    prefix: [u8; TXID_PREFIX_LEN],
+    prefix: [u8; PREFIX_LEN],
 }
 
 impl_consensus_encoding!(TxidPrefix, prefix);
 
 fn txid_prefix(txid: &Txid) -> TxidPrefix {
-    let mut prefix = [0u8; TXID_PREFIX_LEN];
-    prefix.copy_from_slice(&txid[..TXID_PREFIX_LEN]);
+    let mut prefix = [0u8; PREFIX_LEN];
+    prefix.copy_from_slice(&txid[..PREFIX_LEN]);
     TxidPrefix { prefix }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct TxidRow {
     prefix: TxidPrefix,
-    pos: FilePos, // transaction position on disk
+    height: Height, // transaction confirmed height
 }
 
-impl_consensus_encoding!(TxidRow, prefix, pos);
+impl_consensus_encoding!(TxidRow, prefix, height);
 
 impl TxidRow {
-    pub fn scan_prefix(txid: &Txid) -> Box<[u8]> {
+    pub fn scan_prefix(txid: Txid) -> Box<[u8]> {
         Box::new(txid_prefix(&txid).prefix)
     }
 
-    pub fn new(txid: Txid, pos: FilePos) -> Self {
+    pub fn new(txid: Txid, height: usize) -> Self {
         Self {
             prefix: txid_prefix(&txid),
-            pos,
+            height: height.try_into().expect("invalid height"),
         }
     }
 
@@ -210,44 +191,42 @@ impl TxidRow {
         serialize(self).into_boxed_slice()
     }
 
-    pub fn from_db_row(row: &[u8]) -> Result<Self> {
-        deserialize(&row).context("bad TxidRow")
+    pub fn from_db_row(row: &[u8]) -> Self {
+        deserialize(&row).expect("bad TxidRow")
     }
 
-    pub fn position(&self) -> &FilePos {
-        &self.pos
+    pub fn height(&self) -> usize {
+        self.height.try_into().expect("invalid height")
     }
 }
 
 // ***************************************************************************
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct BlockRow {
+pub(crate) struct HeaderRow {
     pub header: BlockHeader,
-    pub pos: FilePos, // block position on disk
-    pub size: u32,    // block size on disk
 }
 
-impl_consensus_encoding!(BlockRow, header, pos, size);
+impl_consensus_encoding!(HeaderRow, header);
 
-impl BlockRow {
-    pub fn new(header: BlockHeader, pos: FilePos, size: u32) -> Self {
-        Self { header, pos, size }
+impl HeaderRow {
+    pub fn new(header: BlockHeader) -> Self {
+        Self { header }
     }
 
     pub fn to_db_row(&self) -> db::Row {
         serialize(self).into_boxed_slice()
     }
 
-    pub fn from_db_row(row: &[u8]) -> Result<Self> {
-        deserialize(&row).context("bad BlockRowKey")
+    pub fn from_db_row(row: &[u8]) -> Self {
+        deserialize(&row).expect("bad HeaderRow")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::types::{FilePos, ScriptHash, ScriptHashRow};
-    use bitcoin::{hashes::hex::ToHex, Address};
+    use crate::types::{spending_prefix, ScriptHash, ScriptHashRow, SpendingPrefix};
+    use bitcoin::{hashes::hex::ToHex, Address, OutPoint, Txid};
     use serde_json::{from_str, json};
 
     use std::str::FromStr;
@@ -264,16 +243,10 @@ mod tests {
     fn test_script_hash_row() {
         let hex = "\"4b3d912c1523ece4615e91bf0d27381ca72169dbf6b1c2ffcc9f92381d4984a3\"";
         let script_hash: ScriptHash = from_str(&hex).unwrap();
-        let row1 = ScriptHashRow::new(
-            script_hash,
-            FilePos {
-                file_id: 0x1234,
-                offset: 0x12345678,
-            },
-        );
+        let row1 = ScriptHashRow::new(script_hash, 123456);
         let db_row = row1.to_db_row();
         assert_eq!(db_row[..].to_hex(), "a384491d38929fcc341278563412");
-        let row2 = ScriptHashRow::from_db_row(&db_row).unwrap();
+        let row2 = ScriptHashRow::from_db_row(&db_row);
         assert_eq!(row1, row2);
     }
 
@@ -284,6 +257,37 @@ mod tests {
         assert_eq!(
             script_hash.to_hex(),
             "00dfb264221d07712a144bda338e89237d1abd2db4086057573895ea2659766a"
+        );
+    }
+
+    #[test]
+    fn test_spending_prefix() {
+        let hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let txid = Txid::from_str(hex).unwrap();
+
+        assert_eq!(
+            spending_prefix(OutPoint { txid, vout: 0 }),
+            SpendingPrefix {
+                prefix: [31, 30, 29, 28, 27, 26, 25, 24]
+            }
+        );
+        assert_eq!(
+            spending_prefix(OutPoint { txid, vout: 10 }),
+            SpendingPrefix {
+                prefix: [31, 30, 29, 28, 27, 26, 25, 34]
+            }
+        );
+        assert_eq!(
+            spending_prefix(OutPoint { txid, vout: 255 }),
+            SpendingPrefix {
+                prefix: [31, 30, 29, 28, 27, 26, 26, 23]
+            }
+        );
+        assert_eq!(
+            spending_prefix(OutPoint { txid, vout: 256 }),
+            SpendingPrefix {
+                prefix: [31, 30, 29, 28, 27, 26, 26, 24]
+            }
         );
     }
 }

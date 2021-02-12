@@ -42,6 +42,7 @@ impl Into<Network> for BitcoinNetwork {
 
 #[derive(Debug)]
 pub struct Config {
+    pub network: Network,
     pub electrum_rpc_addr: SocketAddr,
     pub daemon_rpc_addr: SocketAddr,
     pub monitoring_addr: SocketAddr,
@@ -92,6 +93,7 @@ impl Config {
         };
 
         let config = Self {
+            network: config.network,
             electrum_rpc_addr,
             daemon_rpc_addr,
             monitoring_addr,

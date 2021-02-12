@@ -1,5 +1,5 @@
 target
-*db/
+/db*/
 _*/
 *.log
 *.sublime*
